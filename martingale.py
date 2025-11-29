@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
+from cost import base_position_size as calc_base_position_pct
 from core.types import BarData, OrderResult, OrderSide, SignalAction, TradeSignal
 from strategies.base import BaseStrategy
 from strategies.zerolag import zero_lag_from_bars, zero_lag_min_bars
@@ -33,12 +34,12 @@ class PositionState:
 class MartingaleStrategy(BaseStrategy):
     DEFAULTS: Dict[str, float] = {
         "entry_logic": "ZERO_LAG",
-        "take_profit_percent": 5.0,
-        "take_profit_min_percent": 2.0,
+        "take_profit_percent": 7.0,
+        "take_profit_min_percent": 5.0,
         "take_profit_decay_hours": 240.0,
-        "martingale_trigger": 10.0,
-        "martingale_mult": 2.4,
-        "base_position_pct": 0.05,
+        "martingale_trigger": 8.0,
+        "martingale_mult": 2,
+        "base_position_pct": None,  # computed dynamically from martingale settings
         "fixed_position": False,
         "start_position_size": 10.0,
         "symbol": "ETHUSDT",
@@ -49,6 +50,12 @@ class MartingaleStrategy(BaseStrategy):
 
     def __init__(self, **params: float) -> None:
         merged = {**self.DEFAULTS, **params}
+        base_pct_param = params.get("base_position_pct")
+        if base_pct_param is None:
+            merged["base_position_pct"] = self.compute_default_base_position_pct(
+                float(merged.get("martingale_mult", self.DEFAULTS["martingale_mult"])),
+                float(merged.get("martingale_trigger", self.DEFAULTS["martingale_trigger"])),
+            )
         max_levels_override = merged.pop("max_levels", None)
         if "max_levels" in params:
             logger.warning("Strategy param 'max_levels' is deprecated; configure via risk.max_levels instead.")
@@ -68,6 +75,12 @@ class MartingaleStrategy(BaseStrategy):
         self.flat_tolerance = max(float(flat_tol or 0.0), 0.0)
         self.max_levels_limit: Optional[int] = None
         self.set_max_levels_limit(max_levels_override)
+
+    @staticmethod
+    def compute_default_base_position_pct(martingale_mult: float, martingale_trigger: float) -> float:
+        """Base position % so 4 levels consume full capital; rounded down to 4 decimals."""
+        pct = calc_base_position_pct(martingale_mult, martingale_trigger)
+        return math.floor(pct * 1e4) / 1e4
 
     # State management ----------------------------------------------------
 

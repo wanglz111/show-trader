@@ -13,7 +13,7 @@ import backtrader as bt
 
 from core.types import BarData, OrderResult, OrderSide, SignalAction
 from martingale import MartingaleStrategy
-from strategies.zerolag import zero_lag_from_bars
+from strategies.zerolag import zero_lag_from_bars, zero_lag_stream
 
 
 def _to_utc_timestamp(dt: datetime) -> int:
@@ -45,11 +45,7 @@ def _precompute_zero_lag_series(
     bars: List[BarData], length: int, mult: float
 ) -> List[Dict[str, object] | None]:
     precomputed: List[Dict[str, object] | None] = []
-    rolling: List[BarData] = []
-    trend = 0
-    for bar in bars:
-        rolling.append(bar)
-        decision, metrics, trend = zero_lag_from_bars(rolling, length, mult, trend)
+    for decision, metrics, trend in zero_lag_stream(bars, length, mult, prev_trend=0):
         if metrics:
             precomputed.append({"decision": decision, "metrics": metrics, "trend": trend})
         else:
@@ -65,13 +61,9 @@ def _write_zero_lag_cache_file(
     Record layout: valid(1 byte), decision(int8, 127=none), trend(int8), upper(float64), lower(float64), zlema(float64)
     """
     struct_fmt = struct.Struct("<Bbbddd")
-    rolling: List[BarData] = []
-    trend = 0
-    count = 0
     with cache_path.open("wb") as f:
-        for bar in bars:
-            rolling.append(bar)
-            decision, metrics, trend = zero_lag_from_bars(rolling, length, mult, trend)
+        count = 0
+        for decision, metrics, trend in zero_lag_stream(bars, length, mult, prev_trend=0):
             if metrics:
                 dec_byte = 127 if decision is None else int(decision)
                 data = struct_fmt.pack(
@@ -186,8 +178,8 @@ class MartingaleBacktrader(bt.Strategy):
             avg_price=order.executed.price,
             timestamp=ts,
         )
-        self.martingale.on_order_fill(result)
         if order.isbuy():
+            self.martingale.on_order_fill(result)
             if self._cycle_qty <= 0:
                 self._cycle_open_ts = _to_utc_timestamp(ts)
                 self._cycle_cost = 0.0
@@ -205,6 +197,7 @@ class MartingaleBacktrader(bt.Strategy):
                 }
             )
         else:
+            fills_snapshot = [dict(f) for f in self.martingale.position.fills]
             qty = abs(order.executed.size)
             proceeds = order.executed.price * qty
             profit = proceeds - self._cycle_cost
@@ -216,8 +209,10 @@ class MartingaleBacktrader(bt.Strategy):
                     "cost": round(self._cycle_cost, 4),
                     "proceeds": round(proceeds, 4),
                     "profit": round(profit, 4),
+                    "fills": fills_snapshot,
                 }
             )
+            self.martingale.on_order_fill(result)
             self._cycle_cost = 0.0
             self._cycle_qty = 0.0
             self._cycle_open_ts = None
@@ -337,18 +332,30 @@ def _write_chart(
 
     // Profit table
     const formatTs = (t) => new Date(t * 1000).toLocaleString();
+    const formatFillTs = (t) => t ? new Date(t).toLocaleString() : '-';
     const totalProfit = DATA.cycles.reduce((acc, c) => acc + (c.profit || 0), 0);
-    const rows = DATA.cycles.map((c, idx) => `
+    const rows = DATA.cycles.map((c, idx) => {{
+      const fillDetails = (c.fills || []).map((f, fidx) => {{
+        const ts = formatFillTs(f.timestamp);
+        const qty = f.quantity ?? '';
+        const price = f.price ?? '';
+        const level = f.level ?? (fidx + 1);
+        const cost = (qty && price) ? (qty * price).toFixed(4) : '';
+        return 'L' + level + ': ' + ts + ' qty ' + qty + ' cost ' + cost + ' @ $' + price;
+      }}).join('<br>');
+      return `
       <tr>
         <td>${{idx + 1}}</td>
         <td>${{formatTs(c.open_time)}}</td>
         <td>${{formatTs(c.close_time)}}</td>
         <td>${{c.quantity}}</td>
+        <td>${{fillDetails}}</td>
         <td>${{c.cost}}</td>
         <td>${{c.proceeds}}</td>
         <td style="color: ${{c.profit >= 0 ? '#22c55e' : '#ef4444'}}">${{c.profit}}</td>
       </tr>
-    `).join('');
+    `;
+    }}).join('');
     document.getElementById('summary').innerHTML = `
       <style>
         #summary {{ padding: 12px 16px; font-size: 14px; }}
@@ -364,6 +371,7 @@ def _write_chart(
             <th>开仓时间</th>
             <th>平仓时间</th>
             <th>数量</th>
+            <th>开仓/加仓明细</th>
             <th>成本</th>
             <th>收入</th>
             <th>利润</th>
@@ -391,14 +399,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--data", required=True, help="CSV file with columns: datetime,open,high,low,close,volume (with header).")
     parser.add_argument("--datetime-format", default="%Y-%m-%d %H:%M:%S", help="Python datetime.strptime format for the CSV datetime column.")
     parser.add_argument("--cash", type=float, default=10000.0, help="Starting cash.")
-    parser.add_argument("--commission", type=float, default=0.0005, help="Commission (fractional).")
+    parser.add_argument("--commission", type=float, default=0.0001, help="Commission (fractional).")
     parser.add_argument("--chart", default="chart.html", help="Output HTML file.")
     parser.add_argument("--symbol", default="ETHUSDT", help="Symbol name used by the strategy.")
-    parser.add_argument("--zero-lag-length", type=int, default=70, help="Zero-lag length parameter.")
+    parser.add_argument("--zero-lag-length", type=int, default=60, help="Zero-lag length parameter.")
     parser.add_argument("--zero-lag-mult", type=float, default=1.2, help="Zero-lag multiplier parameter.")
-    parser.add_argument("--martingale-trigger", type=float, default=10.0, help="Percent drop to trigger add position.")
-    parser.add_argument("--martingale-mult", type=float, default=2.4, help="Position size multiplier when averaging down.")
-    parser.add_argument("--base-position-pct", type=float, default=0.05, help="Base position percent of cash for first entry.")
+    parser.add_argument("--martingale-trigger", type=float, default=8.0, help="Percent drop to trigger add position.")
+    parser.add_argument("--martingale-mult", type=float, default=1.6, help="Position size multiplier when averaging down.")
+    parser.add_argument(
+        "--base-position-pct",
+        type=float,
+        default=None,
+        help="Base position percent of cash for first entry (defaults to cost.py formula, rounded down to 4 decimals).",
+    )
     parser.add_argument("--start-position-size", type=float, default=10.0, help="Fixed start size when fixed_position is true.")
     parser.add_argument("--fixed-position", action="store_true", help="Use fixed start position size instead of pct-of-cash.")
     parser.add_argument("--take-profit-percent", type=float, default=MartingaleStrategy.DEFAULTS["take_profit_percent"])
@@ -417,6 +430,8 @@ def run_backtest(
 ) -> Dict[str, float]:
     zero_lag_length = int(martingale_params.get("zero_lag_length", MartingaleStrategy.DEFAULTS["zero_lag_length"]))
     zero_lag_mult = float(martingale_params.get("zero_lag_mult", MartingaleStrategy.DEFAULTS["zero_lag_mult"]))
+    martingale_mult = float(martingale_params.get("martingale_mult", MartingaleStrategy.DEFAULTS["martingale_mult"]))
+    martingale_trigger = float(martingale_params.get("martingale_trigger", MartingaleStrategy.DEFAULTS["martingale_trigger"]))
     cache_path = martingale_params.get("zero_lag_cache_path")
     cache_count = martingale_params.get("zero_lag_cache_count")
     if cache_path:
@@ -425,11 +440,15 @@ def run_backtest(
     else:
         cache_path = chart_path.with_suffix(".zlcache.bin")
         cache_count = ensure_zero_lag_cache(csv_path, datetime_format, zero_lag_length, zero_lag_mult, cache_path)
+    base_position_pct = martingale_params.get("base_position_pct")
+    if base_position_pct is None:
+        base_position_pct = MartingaleStrategy.compute_default_base_position_pct(martingale_mult, martingale_trigger)
     martingale_params = {
         **martingale_params,
         "zero_lag_cache_path": str(cache_path),
         "zero_lag_cache_count": cache_count,
         "precomputed_zero_lag": None,  # avoid duplicating in RAM
+        "base_position_pct": base_position_pct,
     }
 
     cerebro = bt.Cerebro()
@@ -479,7 +498,11 @@ def main() -> None:
         zero_lag_mult=args.zero_lag_mult,
         martingale_trigger=args.martingale_trigger,
         martingale_mult=args.martingale_mult,
-        base_position_pct=args.base_position_pct,
+        base_position_pct=(
+            args.base_position_pct
+            if args.base_position_pct is not None
+            else MartingaleStrategy.compute_default_base_position_pct(args.martingale_mult, args.martingale_trigger)
+        ),
         start_position_size=args.start_position_size,
         fixed_position=args.fixed_position,
         take_profit_percent=args.take_profit_percent if hasattr(args, "take_profit_percent") else MartingaleStrategy.DEFAULTS["take_profit_percent"],

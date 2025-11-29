@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math
 from collections import deque
-from typing import Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from core.types import BarData
 
@@ -80,8 +80,11 @@ def zero_lag_from_bars(
     prev_trend: int,
 ) -> Tuple[Optional[int], Dict[str, float], int]:
 
+    # Normalize to list to allow slicing even if caller passes deque
+    bar_seq: List[BarData] = list(bars)
+
     max_window = length * 3 + 1
-    window_bars = bars[-max_window:] if len(bars) > max_window else bars
+    window_bars = bar_seq[-max_window:] if len(bar_seq) > max_window else bar_seq
 
     closes = [b.close for b in window_bars]
     highs = [b.high for b in window_bars]
@@ -145,3 +148,77 @@ def zero_lag_from_bars(
 
     decision = 1 if (breakout and trend == 1) else None
     return decision, metrics, trend
+
+
+def zero_lag_stream(
+    bars: Sequence[BarData],
+    length: int,
+    mult: float,
+    prev_trend: int = 0,
+) -> List[Tuple[Optional[int], Dict[str, float], int]]:
+    """
+    Faster O(n) zero-lag series over the full bar list (avoids per-bar slicing).
+    Returns (decision, metrics, trend) per bar; metrics empty until enough history.
+    """
+    if not bars:
+        return []
+
+    lag = max(1, int((length - 1) / 2))
+    max_window = length * 3 + 1
+    closes = [b.close for b in bars]
+    highs = [b.high for b in bars]
+    lows = [b.low for b in bars]
+
+    adjusted: List[float] = []
+    for i, c in enumerate(closes):
+        if i < lag:
+            adjusted.append(c)
+        else:
+            adjusted.append(c + (c - closes[i - lag]))
+
+    zlema = _ema_series(adjusted, length)
+    atr = _atr(highs, lows, closes, length)
+    highest_atr = _rolling_max(atr, length * 3)
+
+    results: List[Tuple[Optional[int], Dict[str, float], int]] = []
+    trend = prev_trend
+    for i in range(len(closes)):
+        if i + 1 < max_window:
+            results.append((None, {}, trend))
+            continue
+
+        last = i
+        prev = i - 1
+        zlema_curr = zlema[last]
+        atr_prev = highest_atr[prev]
+
+        if not (math.isfinite(zlema_curr) and math.isfinite(atr_prev)):
+            results.append((None, {}, trend))
+            continue
+
+        volatility = atr_prev * mult
+        upper = zlema_curr + volatility
+        lower = zlema_curr - volatility
+
+        c = closes[last]
+        p = closes[prev]
+
+        new_trend = trend
+        if p <= upper and c > upper:   # crossover
+            new_trend = 1
+        elif p >= lower and c < lower: # crossunder
+            new_trend = -1
+
+        breakout = (new_trend != trend)
+        trend = new_trend
+
+        metrics = {
+            "zlema": float(zlema_curr),
+            "upper": float(upper),
+            "lower": float(lower),
+            "trend": trend,
+            "breakout": breakout,
+        }
+        decision = 1 if (breakout and trend == 1) else None
+        results.append((decision, metrics, trend))
+    return results

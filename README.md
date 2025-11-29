@@ -46,11 +46,11 @@ python3 batch_backtest.py \
   --summary-html charts/summary.html
 ```
 参数网格（可在 `build_combos()` 里改）：
-- take_profit_percent: 5–7.5 步长 0.5
-- take_profit_min_percent: 3–5 步长 0.5
-- take_profit_decay_hours: 120–240 步长 30
-- martingale_trigger: 8–12 步长 1
-- martingale_mult: 1.6–2.4 步长 0.2
+- take_profit_percent: 4–7 步长 0.5
+- take_profit_min_percent: 2.5–4 步长 0.5
+- take_profit_decay_hours: 固定 240
+- martingale_trigger: 7–11 步长 1
+- martingale_mult: 1.5–2.2 步长 0.1
 
 产物：
 - `charts/*.html`：每组参数的轻量图（含交易标记、均价线、每轮利润表、总利润）。
@@ -59,6 +59,19 @@ python3 batch_backtest.py \
 
 ### 随机窗口切片 + 均值指标
 从最近 36 个月里随机切出多段窗口（仍然复用 zerolag 缓存），跑完后会额外生成参数组合的平均收益率、平均持仓时间汇总。
+```bash
+python3 batch_backtest.py \
+  --data BNBUSDT_1m_last37m_20221115-20251129.csv \
+  --symbol BNBUSDT \
+  --outdir charts_bnb \
+  --max-charts 0 \
+  --workers 14 \ 
+  --coverage-window 12:6 \          # 抽 6 组 12 个月窗口，覆盖 37 个月全区间
+  --checkpoint-every 1 \            # 每跑完一组就保存，方便恢复
+  --aggregate-csv charts_bnb/aggregate_summary.csv
+```
+
+或要随机窗口：
 ```bash
 python3 batch_backtest.py \
   --data BNBUSDT_1m_last37m_20221115-20251129.csv \

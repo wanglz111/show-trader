@@ -37,20 +37,30 @@ def combo_filename(
 
 
 def build_combos() -> List[dict]:
-    tpp = list(frange(5.0, 8, 1))
-    tpmin = list(frange(3.0, 5.0, 1))
-    tpdecay = list(frange(120.0, 240.0, 60.0))
-    mt = list(frange(8.0, 12.0, 2.0))
-    mm = list(frange(1.6, 2.4, 0.4))
-    combos = []
-    for tppv, tpminv, tpdh, mtv, mmv in product(tpp, tpmin, tpdecay, mt, mm):
+    """参数网格：TP 4-7%，TP 下限 2.5-4%，衰减 240h，触发 7-11%，倍数 1.5-2.2。"""
+    take_profit_percent_range = frange(4.0, 7.0, 0.5)
+    take_profit_min_percent_range = frange(2.5, 4.0, 0.5)
+    take_profit_decay_hours_range = [240.0]
+    martingale_trigger_range = frange(7.0, 11.0, 1.0)
+    martingale_mult_range = frange(1.5, 2.2, 0.1)
+
+    combos: List[dict] = []
+    for take_profit_percent, take_profit_min_percent, take_profit_decay_hours, martingale_trigger, martingale_mult in product(
+        take_profit_percent_range,
+        take_profit_min_percent_range,
+        take_profit_decay_hours_range,
+        martingale_trigger_range,
+        martingale_mult_range,
+    ):
+        if take_profit_min_percent > take_profit_percent:
+            continue
         combos.append(
             dict(
-                take_profit_percent=tppv,
-                take_profit_min_percent=tpminv,
-                take_profit_decay_hours=tpdh,
-                martingale_trigger=mtv,
-                martingale_mult=mmv,
+                take_profit_percent=take_profit_percent,
+                take_profit_min_percent=take_profit_min_percent,
+                take_profit_decay_hours=take_profit_decay_hours,
+                martingale_trigger=martingale_trigger,
+                martingale_mult=martingale_mult,
             )
         )
     return combos
@@ -298,6 +308,21 @@ def parse_random_slices(raw: str | None) -> List[tuple[int, int]]:
     return pairs
 
 
+def parse_coverage_window(raw: str | None) -> tuple[int, int] | None:
+    """
+    Parse --coverage-window input like "12:6" into (12, 6).
+    """
+    if not raw:
+        return None
+    if ":" not in raw:
+        raise ValueError("Invalid coverage window, expected months:count, e.g. 12:6")
+    months_s, count_s = raw.split(":", 1)
+    months, count = int(months_s), int(count_s)
+    if months <= 0 or count <= 0:
+        raise ValueError("Coverage window months and count must be positive.")
+    return months, count
+
+
 def build_random_windows(
     source_csv: Path,
     datetime_format: str,
@@ -343,6 +368,53 @@ def build_random_windows(
     return windows
 
 
+def build_spanning_windows(
+    source_csv: Path,
+    datetime_format: str,
+    months: int,
+    count: int,
+    outdir: Path,
+) -> List[dict]:
+    """
+    Evenly space fixed-length windows across the full dataset timeframe.
+    Ensures we cover the earliest and latest data points.
+    """
+    if count <= 0 or months <= 0:
+        return []
+    df = pd.read_csv(source_csv, parse_dates=["datetime"])
+    if df.empty:
+        raise ValueError(f"Source CSV {source_csv} is empty.")
+    df = df.sort_values("datetime")
+    start_dt = df["datetime"].min()
+    end_dt = df["datetime"].max()
+    latest_start = end_dt - pd.DateOffset(months=months)
+    # If the dataset is shorter than the window, clamp to start.
+    if latest_start < start_dt:
+        latest_start = start_dt
+    if count == 1 or latest_start == start_dt:
+        start_points = [latest_start]
+    else:
+        total_seconds = (latest_start - start_dt).total_seconds()
+        step_seconds = total_seconds / (count - 1)
+        start_points = [start_dt + pd.Timedelta(seconds=step_seconds * idx) for idx in range(count)]
+
+    window_dir = outdir.expanduser().resolve() / "windowed_spanning"
+    window_dir.mkdir(parents=True, exist_ok=True)
+    windows: List[dict] = []
+    for idx, start in enumerate(start_points, start=1):
+        end = start + pd.DateOffset(months=months)
+        sliced = df[(df["datetime"] >= start) & (df["datetime"] <= end)]
+        if sliced.empty:
+            continue
+        label = f"{months}m-span{idx}"
+        target = window_dir / f"{source_csv.stem}_{label}.csv"
+        sliced.to_csv(target, index=False)
+        windows.append({"label": label, "months": months, "csv_path": target})
+    if not windows:
+        raise ValueError(f"No spanning windows generated from {source_csv} with {months}m x {count}.")
+    return windows
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch-generate martingale backtest charts for parameter grids.")
     parser.add_argument("--data", default="ETHUSDT_1h.csv", help="Path to CSV (datetime,open,high,low,close,volume with header).")
@@ -366,14 +438,14 @@ def parse_args() -> argparse.Namespace:
         "--windows",
         nargs="+",
         type=int,
-        default=[3, 6, 9, 12, 15, 18, 24, 30, 36, 42, 48],
-        help="Window sizes in months to backtest (default: 3 6 9 12 15 18 24 30 36 42 48).",
+        default=[36],
+        help="Window sizes in months to backtest (default: 36).",
     )
     parser.add_argument(
         "--checkpoint-every",
         type=int,
-        default=10,
-        help="Rewrite summary CSV/HTML every N completed backtests to avoid losing progress on interruption.",
+        default=1,
+        help="Rewrite summary/aggregate every N completed backtests to avoid losing progress on interruption.",
     )
     parser.add_argument("--workers", type=int, default=None, help="Number of parallel processes (default: cpu_count())")
     parser.add_argument(
@@ -387,6 +459,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--random-base-months", type=int, default=36, help="Use only the most recent N months as the pool for random slices.")
     parser.add_argument("--random-seed", type=int, default=42, help="Seed for random slice reproducibility.")
+    parser.add_argument(
+        "--coverage-window",
+        help="Evenly spaced fixed windows across full dataset, e.g. '12:6' for six 12-month spans (overrides --windows / --random-slices).",
+    )
     return parser.parse_args()
 
 
@@ -450,11 +526,20 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     summary_csv = Path(args.summary_csv).expanduser().resolve()
     summary_html = Path(args.summary_html).expanduser().resolve()
+    agg_path = Path(args.aggregate_csv).expanduser().resolve()
 
     combos = load_combos_from_file(Path(args.combos_file)) if args.combos_file else build_combos()
     summaries: List[Dict[str, float]] = []
     args_dict: Dict[str, float | str | int | bool] = vars(args).copy()
     existing_charts: dict[str, set[str]] = {}
+
+    def flush_outputs() -> None:
+        if not summaries:
+            return
+        write_summaries(summaries, summary_csv, summary_html)
+        aggregates = aggregate_combo_stats(summaries)
+        if aggregates:
+            write_aggregate_csv(aggregates, agg_path)
 
     if args.resume and summary_csv.exists():
         with summary_csv.open(newline="", encoding="utf-8") as f:
@@ -494,15 +579,18 @@ def main() -> None:
         print("No combos to run (empty grid or combos file).")
         return
 
+    coverage_plan = parse_coverage_window(args.coverage_window)
     random_slice_plan = parse_random_slices(args.random_slices)
-    windows = (
-        build_random_windows(csv_path, args.datetime_format, args.random_base_months, random_slice_plan, outdir, seed=args.random_seed)
-        if random_slice_plan
-        else [
+    if coverage_plan:
+        cov_months, cov_count = coverage_plan
+        windows = build_spanning_windows(csv_path, args.datetime_format, cov_months, cov_count, outdir)
+    elif random_slice_plan:
+        windows = build_random_windows(csv_path, args.datetime_format, args.random_base_months, random_slice_plan, outdir, seed=args.random_seed)
+    else:
+        windows = [
             {"label": f"{months}m", "months": months, "csv_path": ensure_window_csv(csv_path, months, args.datetime_format, outdir)}
             for months in args.windows
         ]
-    )
     if not windows:
         print("No windows to process (check --windows or --random-slices).")
         return
@@ -564,7 +652,7 @@ def main() -> None:
                         f"Profit {row['total_profit']:.2f}, Return {row['return_pct']:.2f}%"
                     )
                     if len(summaries) % max(args.checkpoint_every, 1) == 0:
-                        write_summaries(summaries, summary_csv, summary_html)
+                        flush_outputs()
                 except Exception as exc:
                     print(f"[{window_label} {idx}/{len(combos_to_run)}] job failed: {exc}")
         except KeyboardInterrupt:
@@ -577,13 +665,9 @@ def main() -> None:
                 pool.shutdown(wait=True, cancel_futures=True)
 
     if summaries:
-        write_summaries(summaries, summary_csv, summary_html)
+        flush_outputs()
         print(f"Summary CSV/HTML written to {summary_csv} / {summary_html}")
-        aggregates = aggregate_combo_stats(summaries)
-        if aggregates:
-            agg_path = Path(args.aggregate_csv).expanduser().resolve()
-            write_aggregate_csv(aggregates, agg_path)
-            print(f"Aggregate averages written to {agg_path}")
+        print(f"Aggregate averages written to {agg_path}")
 
 
 if __name__ == "__main__":
