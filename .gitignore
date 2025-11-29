@@ -1,0 +1,16 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments and local env files
+.venv/
+.env
+
+# Data and generated artifacts (不要提交数据产出)
+*.csv
+*.html
+*.zlcache.bin
+tmp.*
+charts/
+charts_bnb/
+charts_multi/
