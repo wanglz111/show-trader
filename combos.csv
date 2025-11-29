@@ -1,0 +1,11 @@
+take_profit_percent,take_profit_min_percent,take_profit_decay_hours,martingale_trigger,martingale_mult
+7.5,5,240,10,2
+7,5,240,10,2
+7.5,4.5,240,10,2
+6.5,4.5,180,9,2
+6.5,4.5,150,9,2
+6,4.5,240,9,2
+6,4.5,180,9,2
+7.5,5,180,9,2
+7,5,210,10,2
+6.5,5,210,11,2
