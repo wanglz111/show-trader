@@ -7,6 +7,7 @@ __pycache__/
 .env
 
 # Data and generated artifacts (不要提交数据产出)
+!BNBUSDT_1m_last37m_20221115-20251129.csv
 *.csv
 *.html
 *.zlcache.bin
