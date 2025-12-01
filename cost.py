@@ -38,3 +38,20 @@ def base_position_size(trigger_mult, martingale_trigger):
     martingale_total = martingale_total_cost(n=4, F1=1, P1=100, m=trigger_mult, trigger_percent=martingale_trigger)
     F1_pct = 100.0 / martingale_total
     return F1_pct
+
+
+if __name__ == "__main__":
+    # 示例计算
+    n = 4
+    F1 = 1
+    P1 = 1000
+    m = 1.2
+    trigger_percent = 7
+
+    total_cost = martingale_total_cost(n, F1, P1, m, trigger_percent)
+    print(f"Martingale Total Cost S({n}) = {total_cost}")
+
+    trigger_mult = 1.4
+    martingale_trigger = 7
+    base_pct = base_position_size(trigger_mult, martingale_trigger)
+    print(f"Base Position Size F1% = {base_pct}%")
